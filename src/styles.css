@@ -557,3 +557,253 @@ input[type="range"] {
     transition: none;
   }
 }
+
+/* Paper mode controls */
+.btn-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 14.5px;
+  font-weight: 500;
+}
+
+.switch input {
+  appearance: none;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  border-radius: 10px;
+  background: var(--room-deep);
+  position: relative;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+  flex: none;
+}
+
+.switch input::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 150ms ease;
+}
+
+.switch input:checked {
+  background: var(--teal);
+}
+
+.switch input:checked::after {
+  transform: translateX(16px);
+}
+
+.field-help {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.checks {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 4px;
+}
+
+.checks label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.checks input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--teal);
+  flex: none;
+}
+
+/* Blocks */
+.block {
+  margin: 0 0 1em;
+}
+
+.block-title {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.2;
+  margin: 0 0 0.7em;
+  letter-spacing: -0.01em;
+}
+
+.block-heading {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 1.5em 0 0.6em;
+}
+
+.block-authors {
+  color: var(--ink-soft);
+}
+
+.block-caption,
+.block-footnote,
+.block-table,
+.block-equation,
+.block-reference {
+  font-size: 16px;
+}
+
+.block-code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 14px;
+}
+
+.block-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  vertical-align: middle;
+  margin-right: 8px;
+  padding: 1px 4px 1px 7px;
+  border-radius: 4px;
+  background: var(--room);
+  color: var(--teal-deep);
+  font-family: var(--ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.block-skip {
+  border: none;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 3px;
+  cursor: pointer;
+}
+
+.block-skip:hover {
+  color: var(--error);
+}
+
+.skipped {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 1em;
+  padding: 7px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--ink-soft);
+  font-family: var(--ui);
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.skipped:hover,
+.skipped:focus-visible {
+  border-color: var(--teal);
+  color: var(--ink);
+}
+
+.skipped-tag {
+  flex: none;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--teal-deep);
+}
+
+.skipped-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--serif);
+  font-size: 14.5px;
+}
+
+.skipped-action {
+  flex: none;
+  font-weight: 500;
+  color: var(--teal);
+}
+
+.page-out .skipped {
+  pointer-events: none;
+}
+
+.doc-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  align-items: baseline;
+}
+
+.link {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--teal);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.paste textarea {
+  width: 100%;
+  min-height: 260px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  font: 15px/1.5 var(--ui);
+  color: var(--ink);
+  resize: vertical;
+}
+
+.paste-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+@media (max-width: 860px) {
+  .field-help {
+    display: none;
+  }
+
+  .skipped-preview {
+    display: none;
+  }
+}
+
+.doc-stats > * + *::before {
+  content: "· ";
+  color: var(--line);
+}

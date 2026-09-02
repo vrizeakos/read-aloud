@@ -1,10 +1,47 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { extractPages } from "./pdf.js";
+import { readPdf } from "./pdf.js";
+import { analyzeLayout, applyOptions, DEFAULT_OPTIONS, KIND_LABEL } from "./paper.js";
+import { blocksFromText } from "./textinput.js";
+import { sentencesFromBlocks } from "./sentences.js";
 import { encodeWav } from "./wav.js";
 import "./styles.css";
 
 const LOOKAHEAD = 3;
 const CHARS_PER_SECOND = 14;
+const CACHE_HIGH = 90;
+const CACHE_LOW = 60;
+const STORAGE_KEY = "read-aloud.settings";
+const TAGGED = new Set(["caption", "table", "code", "footnote", "equation", "reference"]);
+const OPTION_LABELS = [
+  ["skipReferences", "Skip references"],
+  ["skipTables", "Skip tables and code"],
+  ["skipCaptions", "Skip figure captions"],
+  ["skipFootnotes", "Skip footnotes"],
+  ["skipEquations", "Skip equations"],
+  ["stripCitations", "Strip citations"],
+];
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    /* fresh start */
+  }
+  return {};
+}
+
+function saveSettings(settings) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    /* private mode or full storage */
+  }
+}
+
+function looksLikeMarkdown(text) {
+  return /^#{1,6}\s|^\s*[-*+]\s|\|.*\|.*\n|\*\*[^*]+\*\*|```/m.test(text);
+}
 
 function formatBytes(n) {
   return `${Math.round(n / 1048576)} MB`;
@@ -17,6 +54,15 @@ function formatDuration(seconds) {
   if (m < 60) return `${m} min`;
   const h = Math.floor(m / 60);
   return `${h} h ${m % 60} min`;
+}
+
+function groupLabel(blocks) {
+  const kind = blocks[0].kind;
+  const same = blocks.every((b) => b.kind === kind);
+  const label = same ? KIND_LABEL[kind] || kind : `${KIND_LABEL[kind] || kind} and more`;
+  if (blocks.length === 1) return label;
+  if (kind === "reference" && same) return `References (${blocks.length})`;
+  return `${label} (${blocks.length})`;
 }
 
 const Icon = {
@@ -48,34 +94,49 @@ const Icon = {
 };
 
 export default function App() {
+  const settings = useMemo(loadSettings, []);
   const [engine, setEngine] = useState({ status: "loading", loaded: 0, total: 0, voices: [] });
   const [doc, setDoc] = useState(null);
   const [docProgress, setDocProgress] = useState(null);
   const [docError, setDocError] = useState(null);
-  const [sentences, setSentences] = useState([]);
+  const [options, setOptions] = useState({ ...DEFAULT_OPTIONS, ...(settings.options || {}) });
+  const [overrides, setOverrides] = useState(() => new Map());
   const [range, setRange] = useState({ from: 1, to: 1 });
-  const [voice, setVoice] = useState("af_heart");
-  const [speed, setSpeed] = useState(1);
+  const [voice, setVoice] = useState(settings.voice || "af_heart");
+  const [speed, setSpeed] = useState(settings.speed || 1);
   const [status, setStatus] = useState("idle"); // idle | playing | paused | buffering
   const [index, setIndex] = useState(0);
   const [download, setDownload] = useState(null); // null | {done,total} | {url,name}
   const [dragging, setDragging] = useState(false);
+  const [paste, setPaste] = useState(null); // null | { text }
 
   const workerRef = useRef(null);
   const ctxRef = useRef(null);
-  const cacheRef = useRef(new Map());
+  const cacheRef = useRef(new Map()); // sentence text -> audio clip
   const pendingRef = useRef(new Set());
   const waitersRef = useRef(new Map());
   const sessionRef = useRef(0);
   const sourceRef = useRef(null);
   const statusRef = useRef("idle");
   const indexRef = useRef(0);
+  const cursorRef = useRef(null); // { block, ordinal } of the current sentence
   const settingsRef = useRef({ voice, speed });
   const boundsRef = useRef({ first: 0, last: -1 });
   const fileInputRef = useRef(null);
   const currentElRef = useRef(null);
+  const downloadingRef = useRef(false);
 
   settingsRef.current = { voice, speed };
+
+  useEffect(() => {
+    saveSettings({ options, voice, speed });
+  }, [options, voice, speed]);
+
+  // Which blocks are read, and the sentences the player walks through.
+  const applied = useMemo(() => (doc ? applyOptions(doc.blocks, options, overrides) : []), [doc, options, overrides]);
+  const sentences = useMemo(() => sentencesFromBlocks(applied), [applied]);
+  const sentencesRef = useRef(sentences);
+  sentencesRef.current = sentences;
 
   const bounds = useMemo(() => {
     let first = -1;
@@ -98,6 +159,8 @@ export default function App() {
   const setCurrent = useCallback((i) => {
     indexRef.current = i;
     setIndex(i);
+    const s = sentencesRef.current[i];
+    cursorRef.current = s ? { block: s.block, ordinal: s.ordinal } : null;
   }, []);
 
   const getCtx = useCallback(() => {
@@ -117,35 +180,49 @@ export default function App() {
     }
   }, []);
 
-  const request = useCallback((i, sentenceList) => {
-    if (cacheRef.current.has(i) || pendingRef.current.has(i)) return;
-    const s = sentenceList[i];
+  const request = useCallback((i) => {
+    const s = sentencesRef.current[i];
     if (!s) return;
-    pendingRef.current.add(i);
+    const key = s.text;
+    if (cacheRef.current.has(key) || pendingRef.current.has(key)) return;
+    pendingRef.current.add(key);
     workerRef.current?.postMessage({
       type: "generate",
-      id: i,
+      key,
       session: sessionRef.current,
-      text: s.text,
+      text: key,
       voice: settingsRef.current.voice,
       speed: settingsRef.current.speed,
     });
   }, []);
 
-  const sentencesRef = useRef(sentences);
-  sentencesRef.current = sentences;
-
   const ensureQueued = useCallback(
     (from) => {
       const { last } = boundsRef.current;
-      for (let i = from; i <= Math.min(from + LOOKAHEAD, last); i++) request(i, sentencesRef.current);
+      for (let i = from; i <= Math.min(from + LOOKAHEAD, last); i++) request(i);
     },
     [request],
   );
 
+  // Audio already played is released; what lies ahead of the cursor stays.
+  const evict = useCallback((keep) => {
+    const cache = cacheRef.current;
+    if (cache.size <= CACHE_HIGH || downloadingRef.current) return;
+    const protect = new Set([keep]);
+    const list = sentencesRef.current;
+    for (let i = indexRef.current; i <= Math.min(indexRef.current + LOOKAHEAD + 2, list.length - 1); i++) {
+      protect.add(list[i].text);
+    }
+    for (const key of cache.keys()) {
+      if (cache.size <= CACHE_LOW) break;
+      if (!protect.has(key)) cache.delete(key);
+    }
+  }, []);
+
   const startSource = useCallback(
     (i) => {
-      const clip = cacheRef.current.get(i);
+      const s = sentencesRef.current[i];
+      const clip = s && cacheRef.current.get(s.text);
       if (!clip) return false;
       const ctx = getCtx();
       if (ctx.state === "suspended") ctx.resume();
@@ -217,36 +294,37 @@ export default function App() {
         case "error":
           setEngine((prev) => ({ ...prev, status: "error", message: msg.message }));
           break;
-        case "split":
-          setSentences(msg.sentences);
-          break;
         case "audio": {
           if (msg.session !== sessionRef.current) break;
-          cacheRef.current.set(msg.id, { samples: msg.samples, sampleRate: msg.sampleRate });
-          pendingRef.current.delete(msg.id);
-          waitersRef.current.get(msg.id)?.resolve?.();
-          waitersRef.current.delete(msg.id);
-          if (statusRef.current === "buffering" && indexRef.current === msg.id) {
-            startSource(msg.id);
-            ensureQueued(msg.id + 1);
+          cacheRef.current.set(msg.key, { samples: msg.samples, sampleRate: msg.sampleRate });
+          pendingRef.current.delete(msg.key);
+          waitersRef.current.get(msg.key)?.resolve?.();
+          waitersRef.current.delete(msg.key);
+          const current = sentencesRef.current[indexRef.current];
+          if (statusRef.current === "buffering" && current?.text === msg.key) {
+            startSource(indexRef.current);
+            ensureQueued(indexRef.current + 1);
           }
+          evict(msg.key);
           break;
         }
-        case "audio-error":
-          pendingRef.current.delete(msg.id);
-          waitersRef.current.get(msg.id)?.reject?.(new Error(msg.message));
-          waitersRef.current.delete(msg.id);
-          if (statusRef.current === "buffering" && indexRef.current === msg.id) {
+        case "audio-error": {
+          pendingRef.current.delete(msg.key);
+          waitersRef.current.get(msg.key)?.reject?.(new Error(msg.message));
+          waitersRef.current.delete(msg.key);
+          const current = sentencesRef.current[indexRef.current];
+          if (statusRef.current === "buffering" && current?.text === msg.key) {
             // Skip a sentence the model could not read.
-            if (msg.id + 1 <= boundsRef.current.last) playIndexRef.current(msg.id + 1);
+            if (indexRef.current + 1 <= boundsRef.current.last) playIndexRef.current(indexRef.current + 1);
             else setPlayback("idle");
           }
           break;
+        }
       }
     };
     worker.postMessage({ type: "load" });
     return () => worker.terminate();
-  }, [startSource, ensureQueued, setPlayback]);
+  }, [startSource, ensureQueued, setPlayback, evict]);
 
   // Any change of voice or speed invalidates generated audio.
   useEffect(() => {
@@ -256,6 +334,31 @@ export default function App() {
     if (wasPlaying) playIndexRef.current(indexRef.current);
     else if (statusRef.current !== "idle") setPlayback("idle");
   }, [voice, speed, resetAudio, setPlayback]);
+
+  // When the set of sentences changes (a block toggled, an option changed),
+  // the cursor follows the sentence it was on.
+  const prevSentencesRef = useRef(sentences);
+  useEffect(() => {
+    if (prevSentencesRef.current === sentences) return;
+    prevSentencesRef.current = sentences;
+    const cur = cursorRef.current;
+    let target = 0;
+    if (cur && sentences.length) {
+      let idx = sentences.findIndex((s) => s.block === cur.block && s.ordinal === cur.ordinal);
+      if (idx < 0) idx = sentences.findIndex((s) => s.block === cur.block);
+      if (idx < 0) idx = sentences.findIndex((s) => s.block > cur.block);
+      if (idx < 0) idx = sentences.length - 1;
+      target = idx;
+    }
+    const active = statusRef.current === "playing" || statusRef.current === "buffering";
+    stopSource();
+    if (active && sentences.length) {
+      playIndexRef.current(target);
+    } else {
+      setPlayback("idle");
+      setCurrent(target);
+    }
+  }, [sentences, stopSource, setPlayback, setCurrent]);
 
   // Keep the cursor inside the chosen page range.
   useEffect(() => {
@@ -275,33 +378,75 @@ export default function App() {
     el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
   }, [index]);
 
+  const beginDocument = useCallback(() => {
+    setDocError(null);
+    resetAudio();
+    setPlayback("idle");
+    setDownload(null);
+    setDoc(null);
+    setOverrides(new Map());
+    setPaste(null);
+    cursorRef.current = null;
+    indexRef.current = 0;
+    setIndex(0);
+  }, [resetAudio, setPlayback]);
+
+  const finishDocument = useCallback((next) => {
+    setDoc(next);
+    setRange({ from: 1, to: next.pageCount });
+  }, []);
+
+  const openText = useCallback(
+    (text, title, markdown) => {
+      beginDocument();
+      const blocks = blocksFromText(text, { markdown });
+      finishDocument({ title, pageCount: 1, blocks, source: "text" });
+    },
+    [beginDocument, finishDocument],
+  );
+
   const openFile = useCallback(
     async (file) => {
-      if (!file || !/pdf$/i.test(file.name) && file.type !== "application/pdf") {
-        setDocError("That file is not a PDF.");
+      if (!file) return;
+      const name = file.name || "";
+      const isPdf = /\.pdf$/i.test(name) || file.type === "application/pdf";
+      const isText = /\.(txt|md|markdown|text)$/i.test(name) || /^text\//.test(file.type);
+      if (!isPdf && !isText) {
+        setDocError("That file is not a PDF, Markdown or plain text file.");
         return;
       }
-      setDocError(null);
-      resetAudio();
-      setPlayback("idle");
-      setDownload(null);
-      setSentences([]);
-      setDoc(null);
+      if (isText) {
+        const text = await file.text();
+        openText(text, name.replace(/\.[^.]+$/, ""), /\.(md|markdown)$/i.test(name) || looksLikeMarkdown(text));
+        return;
+      }
+      beginDocument();
       setDocProgress({ page: 0, total: 0 });
       try {
-        const result = await extractPages(file, (page, total) => setDocProgress({ page, total }));
-        setDoc(result);
-        setRange({ from: 1, to: result.pages.length });
-        setCurrent(0);
-        workerRef.current?.postMessage({ type: "split", pages: result.pages });
+        const { title, pages } = await readPdf(file, (page, total) => setDocProgress({ page, total }));
+        const scanned = !pages.some((p) => p.items.length > 0);
+        const blocks = scanned ? [] : analyzeLayout(pages).blocks;
+        finishDocument({ title, pageCount: pages.length, blocks, source: "pdf", scanned });
       } catch (err) {
         setDocError(`Could not read this PDF. ${err?.message || ""}`.trim());
       } finally {
         setDocProgress(null);
       }
     },
-    [resetAudio, setPlayback, setCurrent],
+    [beginDocument, finishDocument, openText],
   );
+
+  const setOption = useCallback((key, value) => {
+    setOptions((o) => ({ ...o, [key]: value }));
+  }, []);
+
+  const setOverride = useCallback((ids, included) => {
+    setOverrides((prev) => {
+      const next = new Map(prev);
+      for (const id of ids) next.set(id, included);
+      return next;
+    });
+  }, []);
 
   const togglePlay = useCallback(() => {
     if (engine.status !== "ready" || bounds.last < 0) return;
@@ -312,10 +457,14 @@ export default function App() {
     } else if (statusRef.current === "paused" && sourceRef.current) {
       ctx.resume();
       setPlayback("playing");
+    } else if (statusRef.current === "buffering") {
+      // Stop waiting for the voice; the sentence stays generated for later.
+      stopSource();
+      setPlayback("idle");
     } else {
       playIndex(indexRef.current);
     }
-  }, [engine.status, bounds.last, getCtx, playIndex, setPlayback]);
+  }, [engine.status, bounds.last, getCtx, playIndex, stopSource, setPlayback]);
 
   const skip = useCallback(
     (delta) => {
@@ -349,7 +498,7 @@ export default function App() {
   useEffect(() => {
     const onKey = (e) => {
       const tag = e.target?.tagName;
-      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || e.target?.isContentEditable) return;
       if (e.code === "Space") {
         e.preventDefault();
         togglePlay();
@@ -362,23 +511,26 @@ export default function App() {
 
   const downloadAudio = useCallback(async () => {
     if (engine.status !== "ready" || bounds.last < 0) return;
+    const list = sentencesRef.current;
     const ids = [];
     for (let i = bounds.first; i <= bounds.last; i++) ids.push(i);
     const session = sessionRef.current;
     setDownload({ done: 0, total: ids.length });
+    downloadingRef.current = true;
     const chunks = [];
     let rate = 24000;
     try {
       for (let n = 0; n < ids.length; n++) {
         const i = ids[n];
-        if (!cacheRef.current.has(i)) {
+        const key = list[i].text;
+        if (!cacheRef.current.has(key)) {
           await new Promise((resolve, reject) => {
-            waitersRef.current.set(i, { resolve, reject });
-            request(i, sentencesRef.current);
+            waitersRef.current.set(key, { resolve, reject });
+            request(i);
           });
         }
-        if (sessionRef.current !== session) throw new Error("cancelled");
-        const clip = cacheRef.current.get(i);
+        if (sessionRef.current !== session || sentencesRef.current !== list) throw new Error("cancelled");
+        const clip = cacheRef.current.get(key);
         if (clip) {
           chunks.push(clip.samples);
           rate = clip.sampleRate;
@@ -391,6 +543,8 @@ export default function App() {
     } catch (err) {
       if (err?.message !== "cancelled") setDocError(`Download stopped. ${err.message}`);
       setDownload(null);
+    } finally {
+      downloadingRef.current = false;
     }
   }, [engine.status, bounds, request, doc]);
 
@@ -410,6 +564,7 @@ export default function App() {
   }, [index, bounds.last, sentences]);
   const remaining = formatDuration(remainingChars / CHARS_PER_SECOND / speed);
   const current = sentences[index];
+  const readCount = useMemo(() => applied.filter((b) => b.included).length, [applied]);
 
   const voiceGroups = useMemo(() => {
     const byGrade = (a, b) => a.grade.localeCompare(b.grade) || a.name.localeCompare(b.name);
@@ -419,24 +574,28 @@ export default function App() {
     ];
   }, [engine.voices]);
 
-  const pageBlocks = useMemo(() => {
-    const blocks = [];
-    let block = null;
-    let para = null;
+  // Blocks laid out per page, with runs of skipped blocks folded into one row.
+  const pages = useMemo(() => {
+    const byBlock = new Map();
     sentences.forEach((s, i) => {
-      if (!block || block.page !== s.page) {
-        block = { page: s.page, paras: [] };
-        blocks.push(block);
-        para = null;
-      }
-      if (!para || para.key !== s.para) {
-        para = { key: s.para, items: [] };
-        block.paras.push(para);
-      }
-      para.items.push({ ...s, i });
+      if (!byBlock.has(s.block)) byBlock.set(s.block, []);
+      byBlock.get(s.block).push({ ...s, i });
     });
-    return blocks;
-  }, [sentences]);
+    const out = new Map();
+    for (const b of applied) {
+      if (!out.has(b.page)) out.set(b.page, { number: b.page, items: [] });
+      const page = out.get(b.page);
+      if (b.included) {
+        const items = byBlock.get(b.id) || [];
+        if (items.length) page.items.push({ type: "block", block: b, sentences: items });
+      } else {
+        const last = page.items[page.items.length - 1];
+        if (last && last.type === "skipped") last.blocks.push(b);
+        else page.items.push({ type: "skipped", blocks: [b] });
+      }
+    }
+    return [...out.values()];
+  }, [applied, sentences]);
 
   const engineLine = (() => {
     if (engine.status === "loading") {
@@ -450,6 +609,89 @@ export default function App() {
       : "Voice runs on your processor, expect a short wait before each sentence";
   })();
 
+  const renderSentence = (s, active) => {
+    const isCurrent = s.i === index;
+    return (
+      <span
+        key={s.i}
+        ref={isCurrent ? currentElRef : null}
+        className={`sentence ${isCurrent ? `sentence-current sentence-${status}` : ""}`}
+        onClick={() => jumpTo(s.i)}
+        role="button"
+        tabIndex={active ? 0 : -1}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") jumpTo(s.i);
+        }}
+      >
+        {s.display ?? s.text}{" "}
+      </span>
+    );
+  };
+
+  const renderBlock = (item, active) => {
+    const b = item.block;
+    const tag = options.paperMode && TAGGED.has(b.kind) && (
+      <span className="block-tag">
+        {KIND_LABEL[b.kind]}
+        <button
+          className="block-skip"
+          onClick={() => setOverride([b.id], false)}
+          title="Set this block aside"
+          aria-label={`Set aside this ${KIND_LABEL[b.kind].toLowerCase()}`}
+        >
+          ×
+        </button>
+      </span>
+    );
+    const body = item.sentences.map((s) => renderSentence(s, active));
+    if (b.kind === "title") {
+      return (
+        <h2 key={b.id} className="block block-title">
+          {body}
+        </h2>
+      );
+    }
+    if (b.kind === "heading" || (b.kind === "reference" && b.heading)) {
+      return (
+        <h3 key={b.id} className="block block-heading">
+          {tag}
+          {body}
+        </h3>
+      );
+    }
+    return (
+      <p key={b.id} className={`block block-${b.kind}`}>
+        {tag}
+        {body}
+      </p>
+    );
+  };
+
+  const renderSkipped = (item, active, key) => {
+    const ids = item.blocks.map((b) => b.id);
+    const preview = item.blocks
+      .map((b) => b.text)
+      .join(" ")
+      .slice(0, 140);
+    return (
+      <div
+        key={key}
+        className="skipped"
+        role="button"
+        tabIndex={active ? 0 : -1}
+        title="Read this anyway"
+        onClick={() => setOverride(ids, true)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") setOverride(ids, true);
+        }}
+      >
+        <span className="skipped-tag">{groupLabel(item.blocks)}</span>
+        <span className="skipped-preview">{preview}</span>
+        <span className="skipped-action">Read</span>
+      </div>
+    );
+  };
+
   return (
     <div
       className={`app ${dragging ? "app-dragging" : ""}`}
@@ -462,18 +704,26 @@ export default function App() {
     >
       <aside className="rail">
         <h1 className="brand">Read Aloud</h1>
-        <p className="brand-sub">Turns a PDF into speech, entirely in your browser. Nothing is uploaded.</p>
+        <p className="brand-sub">Turns a paper into speech, entirely in your browser. Nothing is uploaded.</p>
 
         <input
           ref={fileInputRef}
           type="file"
-          accept="application/pdf,.pdf"
+          accept=".pdf,.txt,.md,.markdown,application/pdf,text/plain,text/markdown"
           hidden
-          onChange={(e) => openFile(e.target.files?.[0])}
+          onChange={(e) => {
+            openFile(e.target.files?.[0]);
+            e.target.value = "";
+          }}
         />
-        <button className="btn-primary" onClick={() => fileInputRef.current?.click()} disabled={!!docProgress}>
-          {doc ? "Choose another PDF" : "Choose a PDF"}
-        </button>
+        <div className="btn-row">
+          <button className="btn-primary" onClick={() => fileInputRef.current?.click()} disabled={!!docProgress}>
+            {doc ? "Open another file" : "Open a file"}
+          </button>
+          <button className="btn-secondary" onClick={() => setPaste({ text: "" })} disabled={!!docProgress}>
+            Paste text
+          </button>
+        </div>
 
         <label className="field">
           <span>Voice</span>
@@ -511,9 +761,9 @@ export default function App() {
             <input
               type="number"
               min="1"
-              max={doc?.pages.length || 1}
+              max={doc?.pageCount || 1}
               value={range.from}
-              disabled={!doc}
+              disabled={!doc || doc.pageCount < 2}
               onChange={(e) => {
                 const v = Math.min(Math.max(1, +e.target.value || 1), range.to);
                 setRange((r) => ({ ...r, from: v }));
@@ -523,17 +773,42 @@ export default function App() {
             <input
               type="number"
               min="1"
-              max={doc?.pages.length || 1}
+              max={doc?.pageCount || 1}
               value={range.to}
-              disabled={!doc}
+              disabled={!doc || doc.pageCount < 2}
               onChange={(e) => {
-                const max = doc?.pages.length || 1;
+                const max = doc?.pageCount || 1;
                 const v = Math.max(Math.min(max, +e.target.value || max), range.from);
                 setRange((r) => ({ ...r, to: v }));
               }}
             />
-            {doc && <span className="pages-total">of {doc.pages.length}</span>}
+            {doc && <span className="pages-total">of {doc.pageCount}</span>}
           </div>
+        </div>
+
+        <div className="field">
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={options.paperMode}
+              onChange={(e) => setOption("paperMode", e.target.checked)}
+            />
+            <span>Paper mode</span>
+          </label>
+          <p className="field-help">
+            Reads columns in order and sets aside headers, footers, page numbers and figure labels. Click any greyed
+            block in the text to read it anyway.
+          </p>
+          {options.paperMode && (
+            <div className="checks">
+              {OPTION_LABELS.map(([key, label]) => (
+                <label key={key}>
+                  <input type="checkbox" checked={!!options[key]} onChange={(e) => setOption(key, e.target.checked)} />
+                  <span>{label}</span>
+                </label>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className={`engine engine-${engine.status}`}>
@@ -560,16 +835,54 @@ export default function App() {
       </aside>
 
       <main className="stage">
-        {!doc && !docProgress && (
-          <div className="empty">
-            <h2>Drop in a PDF.<br />Press play.</h2>
+        {paste && (
+          <div className="empty paste">
+            <h2>Paste the text.</h2>
             <p>
-              The voice model downloads once, about 90 MB, then stays cached. Works best in Chrome or Edge on a
-              computer with a graphics card.
+              Plain text or Markdown, for example the output of GROBID, Marker or Docling. Headings, tables, captions
+              and references are recognised.
             </p>
-            <button className="btn-primary" onClick={() => fileInputRef.current?.click()}>
-              Choose a PDF
-            </button>
+            <textarea
+              value={paste.text}
+              onChange={(e) => setPaste({ text: e.target.value })}
+              placeholder="Paste here"
+              autoFocus
+            />
+            <div className="paste-actions">
+              <button
+                className="btn-primary"
+                disabled={!paste.text.trim()}
+                onClick={() => openText(paste.text, "Pasted text", looksLikeMarkdown(paste.text))}
+              >
+                Read this
+              </button>
+              <button className="btn-secondary" onClick={() => setPaste(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {!paste && !doc && !docProgress && (
+          <div className="empty">
+            <h2>
+              Drop in a paper.
+              <br />
+              Press play.
+            </h2>
+            <p>
+              PDF, Markdown or plain text. Research papers are cleaned up on the way in: running headers, tables,
+              footnotes, citations and the reference list are set aside so the voice reads the prose. The voice model
+              downloads once, about 90 MB, then stays cached.
+            </p>
+            <div className="btn-row">
+              <button className="btn-primary" onClick={() => fileInputRef.current?.click()}>
+                Open a file
+              </button>
+              <button className="btn-secondary" onClick={() => setPaste({ text: "" })}>
+                Paste text
+              </button>
+            </div>
             {docError && <p className="error">{docError}</p>}
           </div>
         )}
@@ -581,51 +894,48 @@ export default function App() {
           </div>
         )}
 
-        {doc && !docProgress && (
+        {!paste && doc && !docProgress && (
           <article className="document">
             <header className="doc-head">
               <h2>{doc.title}</h2>
-              <p>
-                {doc.pages.length} {doc.pages.length === 1 ? "page" : "pages"}
-                {sentences.length > 0 && `, ${sentences.length} sentences`}
+              <p className="doc-stats">
+                <span>
+                  {doc.pageCount} {doc.pageCount === 1 ? "page" : "pages"}
+                </span>
+                {doc.blocks.length > 0 && (
+                  <span>
+                    {readCount} of {doc.blocks.length} blocks read
+                  </span>
+                )}
+                {sentences.length > 0 && <span>{sentences.length} sentences</span>}
+                {overrides.size > 0 && (
+                  <button className="link" onClick={() => setOverrides(new Map())}>
+                    Reset choices
+                  </button>
+                )}
               </p>
               {docError && <p className="error">{docError}</p>}
             </header>
-            {sentences.length === 0 && <p className="muted">Splitting into sentences</p>}
-            {sentences.length === 0 && doc.pages.every((p) => !p.trim()) && (
+            {doc.scanned && (
               <p className="error">
                 No text was found. This PDF is probably scanned images, which need OCR before they can be read aloud.
               </p>
             )}
-            {pageBlocks.map((block) => {
-              const active = block.page >= range.from && block.page <= range.to;
+            {!doc.scanned && doc.blocks.length > 0 && sentences.length === 0 && (
+              <p className="muted">Everything in this document is set aside. Click a greyed block or change the paper mode settings.</p>
+            )}
+            {pages.map((page) => {
+              const active = page.number >= range.from && page.number <= range.to;
               return (
-                <section key={block.page} className={`page ${active ? "" : "page-out"}`}>
-                  <div className="page-num" aria-label={`Page ${block.page}`}>
-                    {block.page}
-                  </div>
-                  {block.paras.map((para) => (
-                    <p key={para.key}>
-                      {para.items.map((s) => {
-                        const isCurrent = s.i === index;
-                        return (
-                          <span
-                            key={s.i}
-                            ref={isCurrent ? currentElRef : null}
-                            className={`sentence ${isCurrent ? `sentence-current sentence-${status}` : ""}`}
-                            onClick={() => jumpTo(s.i)}
-                            role="button"
-                            tabIndex={active ? 0 : -1}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") jumpTo(s.i);
-                            }}
-                          >
-                            {s.text}{" "}
-                          </span>
-                        );
-                      })}
-                    </p>
-                  ))}
+                <section key={page.number} className={`page ${active ? "" : "page-out"}`}>
+                  {doc.pageCount > 1 && (
+                    <div className="page-num" aria-label={`Page ${page.number}`}>
+                      {page.number}
+                    </div>
+                  )}
+                  {page.items.map((item, k) =>
+                    item.type === "block" ? renderBlock(item, active) : renderSkipped(item, active, `s${page.number}-${k}`),
+                  )}
                 </section>
               );
             })}
@@ -656,7 +966,7 @@ export default function App() {
             <>
               <div className="readout-line">
                 <span>
-                  Page {current.page}, sentence {position} of {inRange}
+                  {doc?.pageCount > 1 ? `Page ${current.page}, sentence` : "Sentence"} {position} of {inRange}
                 </span>
                 <span className="readout-state">
                   {status === "buffering" && "Generating"}
@@ -671,7 +981,7 @@ export default function App() {
             </>
           ) : (
             <div className="readout-line">
-              <span className="muted">{engine.status === "ready" ? "Choose a PDF to begin" : "Getting the voice ready"}</span>
+              <span className="muted">{engine.status === "ready" ? "Open a file to begin" : "Getting the voice ready"}</span>
             </div>
           )}
         </div>

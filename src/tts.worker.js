@@ -1,9 +1,6 @@
-import { KokoroTTS, TextSplitterStream } from "kokoro-js";
+import { KokoroTTS } from "kokoro-js";
 
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
-// Kokoro's tokenizer truncates at ~510 tokens, so very long sentences are
-// split into smaller chunks before synthesis.
-const MAX_CHUNK_CHARS = 380;
 
 let tts = null;
 let device = null;
@@ -58,46 +55,6 @@ async function load() {
   post({ type: "ready", device, dtype, voices });
 }
 
-function splitLongSentence(text) {
-  if (text.length <= MAX_CHUNK_CHARS) return [text];
-  const parts = [];
-  let rest = text;
-  while (rest.length > MAX_CHUNK_CHARS) {
-    const window = rest.slice(0, MAX_CHUNK_CHARS);
-    let cut = Math.max(
-      window.lastIndexOf(", "),
-      window.lastIndexOf("; "),
-      window.lastIndexOf(": "),
-    );
-    if (cut < MAX_CHUNK_CHARS / 3) cut = window.lastIndexOf(" ");
-    if (cut < 1) cut = MAX_CHUNK_CHARS;
-    parts.push(rest.slice(0, cut + 1).trim());
-    rest = rest.slice(cut + 1).trim();
-  }
-  if (rest) parts.push(rest);
-  return parts;
-}
-
-function splitPages(pages) {
-  const out = [];
-  pages.forEach((text, i) => {
-    const paragraphs = text.split(/\n\s*\n/);
-    paragraphs.forEach((para, p) => {
-      const splitter = new TextSplitterStream();
-      splitter.push(para);
-      splitter.close();
-      for (const sentence of splitter.sentences) {
-        for (const chunk of splitLongSentence(sentence)) {
-          const clean = chunk.replace(/\s+/g, " ").trim();
-          if (clean.replace(/[^\p{L}\p{N}]/gu, "").length === 0) continue;
-          out.push({ id: out.length, page: i + 1, para: p, text: clean });
-        }
-      }
-    });
-  });
-  return out;
-}
-
 async function drain() {
   if (running) return;
   running = true;
@@ -105,24 +62,15 @@ async function drain() {
     const job = queue.shift();
     if (job.session !== session) continue;
     try {
-      const audio = await tts.generate(job.text, {
-        voice: job.voice,
-        speed: job.speed,
-      });
+      const audio = await tts.generate(job.text, { voice: job.voice, speed: job.speed });
       if (job.session !== session) continue;
       const data = audio.audio;
       post(
-        {
-          type: "audio",
-          id: job.id,
-          session: job.session,
-          samples: data,
-          sampleRate: audio.sampling_rate,
-        },
+        { type: "audio", key: job.key, session: job.session, samples: data, sampleRate: audio.sampling_rate },
         [data.buffer],
       );
     } catch (err) {
-      post({ type: "audio-error", id: job.id, session: job.session, message: String(err?.message || err) });
+      post({ type: "audio-error", key: job.key, session: job.session, message: String(err?.message || err) });
     }
   }
   running = false;
@@ -135,14 +83,9 @@ self.onmessage = async (e) => {
       case "load":
         await load();
         break;
-      case "split":
-        post({ type: "split", requestId: msg.requestId, sentences: splitPages(msg.pages) });
-        break;
       case "generate":
         // Ignore duplicates already waiting in the queue.
-        if (!queue.some((q) => q.id === msg.id && q.session === msg.session)) {
-          queue.push(msg);
-        }
+        if (!queue.some((q) => q.key === msg.key && q.session === msg.session)) queue.push(msg);
         drain();
         break;
       case "reset":
